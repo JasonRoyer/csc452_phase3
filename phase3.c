@@ -6,6 +6,17 @@
  *  to ignore it.
  */
 
+ 
+/*
+* Author: Jason Royer
+* Partner Name: Steven Broussard
+* Phase 3 Part A
+* TAs: Navdeep & Marty
+* Course: CSC 452 - Princples of Operating Systems
+* Professor Name: John Hartman
+*/
+
+
 #include <assert.h>
 #include <phase1.h>
 #include <phase2.h>
@@ -22,6 +33,7 @@ typedef struct Process {
     int		        numPages;	/* Size of the page table. */
     USLOSS_PTE		*pageTable;	/* The page table for the process. */
     /* Add more stuff here if necessary. */
+	int				*inUse;
 } Process;
 
 static Process	processes[P1_MAXPROC];
@@ -37,6 +49,8 @@ typedef struct Fault {
     int		mbox;		/* Where to send reply. */
     /* Add more stuff here if necessary. */
 } Fault;
+
+int *frameList;
 
 static void	*vmRegion = NULL;
 
@@ -100,7 +114,6 @@ P3_VmInit(int mappings, int pages, int frames, int pagers)
     int		i;
     int		tmp;
     int     result = 0;
-
     CheckMode();
     status = USLOSS_MmuInit(mappings, pages, frames, USLOSS_MMU_MODE_PAGETABLE);
     if (status == USLOSS_MMU_ERR_ON) {
@@ -124,7 +137,9 @@ P3_VmInit(int mappings, int pages, int frames, int pagers)
     P3_vmStats.frames = frames;
     numPages = pages;
     numFrames = frames;
-
+	P3_vmStats.freeFrames = frames;
+	frameList = (int*)calloc(numFrames, sizeof(int));
+	
     status = P1_SemCreate("running", 0, &running);
     assert(status == 0);
 
@@ -132,7 +147,7 @@ P3_VmInit(int mappings, int pages, int frames, int pagers)
     assert(pagerMbox >= 0);
 
     initialized = 1;
-    
+	
     for (int i = 0; i < pagers; i++) {
         char name[30];
         snprintf(name, sizeof(name), "Pager %d\n", i);
@@ -162,7 +177,6 @@ void
 P3_VmDestroy(void)
 {
     int rc;
-
     CheckMode();
     if (initialized) {
         rc = USLOSS_MmuDone();
@@ -171,6 +185,8 @@ P3_VmDestroy(void)
         /*
          * Kill the pagers here.
          */
+		assert(P2_MboxRelease(pagerMbox) == 0);
+		 
         /* 
          * Print vm statistics.
          */
@@ -178,7 +194,13 @@ P3_VmDestroy(void)
         USLOSS_Console("pages: %d\n", P3_vmStats.pages);
         USLOSS_Console("frames: %d\n", P3_vmStats.frames);
         USLOSS_Console("blocks: %d\n", P3_vmStats.blocks);
-        /* and so on... */
+		USLOSS_Console("freeFrames: %d\n", P3_vmStats.freeFrames);
+		USLOSS_Console("freeBlocks: %d\n", P3_vmStats.freeBlocks);
+		USLOSS_Console("faults: %d\n", P3_vmStats.faults);
+		USLOSS_Console("pageIns: %d\n", P3_vmStats.pageIns);
+		USLOSS_Console("pageOuts: %d\n", P3_vmStats.pageOuts);
+		USLOSS_Console("replaced: %d\n", P3_vmStats.replaced);
+		
     }
 }
 
@@ -211,6 +233,7 @@ P3_AllocatePageTable(int pid)
     if (initialized) {
         processes[pid].numPages = numPages;
         processes[pid].pageTable = (USLOSS_PTE *) malloc(sizeof(USLOSS_PTE) * numPages);
+		 processes[pid].inUse = (int*) (int*)calloc(numPages, sizeof(int));
         for (i = 0; i < numPages; i++) {
             processes[pid].pageTable[i].incore = 0;
             processes[pid].pageTable[i].read = 1; // all pages are readable
@@ -255,12 +278,28 @@ P3_FreePageTable(int pid)
          * Free any of the process's pages that are on disk and free any page frames the
          * process is using.
          */
-
+		
+		//currently using
+		for(int i = 0; i < processes[pid].numPages; i ++){
+			if(processes[pid].inUse[i]){
+				if(processes[pid].pageTable[i].incore){
+					// its in memory
+					frameList[processes[pid].pageTable[i].frame] = 0;
+					P3_vmStats.freeFrames++;
+				}else {
+					// its on disk
+				}
+			}
+		}
+		 
+		 
         /* Clean up the page table. */
 
         free((char *) processes[pid].pageTable);
+		free(processes[pid].inUse);
         processes[pid].numPages = 0;
         processes[pid].pageTable = NULL;
+		processes[pid].inUse = NULL;
     }
 }
 
@@ -366,8 +405,50 @@ Pager(void *arg)
     	/* Find a free frame */
     	/* If there isn't one run clock algorithm, write page to disk if necessary */
     	/* Load page into frame from disk or fill with zeros */
-        /* Update faulting process's page table to map page to frame */
-    	/* Unblock waiting (faulting) process */
+		int pageSize = USLOSS_MmuPageSize();
+		int pageNum = (int)fault.addr / pageSize;
+		int freeFrame = -1;
+		int status;
+		for(int i =0; i < numFrames; i++){
+			if (!frameList[i]){
+				frameList[i] = 1;
+				freeFrame = i;
+				break;
+			}
+		}
+		if(freeFrame >= 0){
+		// grant access to pager so that it can Zero
+		
+		processes[P1_GetPID()].inUse[0] = 1;
+		processes[P1_GetPID()].pageTable[0].incore = 1;
+		processes[P1_GetPID()].pageTable[0].frame = freeFrame;
+		status = USLOSS_MmuSetPageTable(&processes[P1_GetPID()].pageTable[0]);
+		assert(status == USLOSS_MMU_OK);
+		// zero out
+		memset(vmRegion, '\0', pageSize);
+		
+		// remove access
+		processes[P1_GetPID()].inUse[0] = 0;
+		processes[P1_GetPID()].pageTable[0].incore = 0;
+		
+			
+        /* Update faulting process's page table to map page to frame mu*/
+		processes[fault.pid].inUse[pageNum] = 1;
+		processes[fault.pid].pageTable[pageNum].frame = freeFrame;
+		P3_vmStats.freeFrames--;
+		processes[fault.pid].pageTable[pageNum].incore = 1;
+		} else {
+			// something is wrong we don't have enough framessadasdasd asdas
+		}
+		
+    	/* Unblock waiting (faulting) process */ 
+		 int msg = 1;
+		 int size = sizeof(int);
+		status = P2_MboxSend(fault.mbox, &msg, &size);
+		assert(status >= 0);
+		
+		
+	
     }
     return 0;
 }
